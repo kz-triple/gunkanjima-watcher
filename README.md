@@ -1,6 +1,6 @@
 # 軍艦島ツアー空き監視
 
-2026-11-19 の AM 便を、5社横断カレンダーで10分ごとに確認し、空き（o）または残りわずか（△）が出たらメール通知します。
+2026-11-19 の AM 便を、5社横断カレンダーで定期確認し、空き（o）または残りわずか（△）が出たらメール通知します。
 
 ## 対象会社
 
@@ -14,25 +14,47 @@
 
 データソース: https://nagasaki-tours.com/gunkanjima-tour-calendar
 
-## おすすめ運用: GitHub Actions（PC不要・無料）
+## 本番運用: cron-job.org（推奨・確実）
 
-PCをつけっぱなしにしなくても、GitHub上で10分ごとに自動チェックします。
+GitHub 純正の `schedule` は遅延・スキップが多いため、**外部タイマーから10分ごとに起動**します。
 
-### 1. GitHubにリポジトリを作る
+### 1. GitHub トークンを作る
 
-**Public（公開）推奨**（無料アカウントでもスケジュール実行できるため）。  
-パスワードはコードに入れず GitHub Secrets に置くので、公開でも安全です。
+1. 開く: https://github.com/settings/personal-access-tokens/new
+2. 設定例:
+   - Token name: `gunkanjima-watcher-cron`
+   - Expiration: `2026-11-20` など（ツアー後でOK）
+   - Repository access: **Only select repositories** → `gunkanjima-watcher`
+   - Permissions → Repository → **Actions: Read and write**
+3. Generate して表示されたトークンをコピー（再表示不可）
 
-```powershell
-cd $env:USERPROFILE\Projects\gunkanjima-watcher
-gh repo create gunkanjima-watcher --public --source=. --remote=origin --push
-```
+### 2. cron-job.org でジョブ作成
 
-`gh` がなければ、GitHubサイトで空のリポジトリを作り `git remote add` → `git push` でもOKです。
+1. https://cron-job.org で無料登録
+2. **CREATE CRONJOB**
+3. 以下を入力:
 
-### 2. Secrets を登録
+| 項目 | 値 |
+|---|---|
+| Title | `gunkanjima-watcher` |
+| URL | `https://api.github.com/repos/kz-triple/gunkanjima-watcher/actions/workflows/check.yml/dispatches` |
+| Schedule | Every 10 minutes（タイムゾーン Asia/Tokyo） |
+| Request method | `POST` |
+| Request body | `{"ref":"main"}` |
 
-リポジトリ → **Settings → Secrets and variables → Actions → New repository secret** で以下を追加:
+**Headers（Advanced）:**
+
+| Key | Value |
+|---|---|
+| `Accept` | `application/vnd.github+json` |
+| `Authorization` | `Bearer ` + 上で作ったトークン |
+| `Content-Type` | `application/json` |
+| `X-GitHub-Api-Version` | `2022-11-28` |
+
+4. **Test Run** → ステータス 204 なら成功
+5. Actions に `workflow_dispatch` が増えていればOK: https://github.com/kz-triple/gunkanjima-watcher/actions
+
+### 3. メール Secrets（済ならスキップ）
 
 | Name | Value |
 |---|---|
@@ -43,20 +65,17 @@ gh repo create gunkanjima-watcher --public --source=. --remote=origin --push
 | `EMAIL_FROM` | `hehuisongjing7@gmail.com` |
 | `EMAIL_TO` | `hehuisongjing7@gmail.com` |
 
-### 3. 動作確認
-
-**Actions** タブ → **Gunkanjima availability check** → **Run workflow** で手動実行。  
-成功すれば、以降は約10分ごとに自動実行されます。
-
 ---
+
+## 補助: GitHub 純正 schedule
+
+バックアップとして **1時間ごと** にも動きます（信頼度は低め）。メインは cron-job.org です。
 
 ## ローカル実行（任意）
 
 ```powershell
 cd $env:USERPROFILE\Projects\gunkanjima-watcher
 .\.venv\Scripts\Activate.ps1
-copy .env.example .env   # 初回のみ
-# .env を編集してから:
 python watcher.py --test-mail
 python watcher.py --once
 ```
@@ -66,5 +85,4 @@ python watcher.py --once
 - カレンダー反映には遅れがある場合があります。メールが来たら各社の公式サイトで即予約してください。
 - △（残りわずか）は2名分が確保できない可能性もあります。
 - 同じ空き状態では再通知しません。満席に戻って再び空いた場合は再通知します。
-- GitHubの定期実行は数分遅れることがあります（目安10〜15分間隔）。
-- 公開リポジトリのスケジュールは、長期間リポジトリに動きがないと止まることがあります。たまに Actions を確認してください。
+- PAT の有効期限が切れると外部起動が止まるので、期限前に更新してください。

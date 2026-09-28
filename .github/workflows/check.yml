@@ -1,9 +1,10 @@
 name: Gunkanjima availability check
 
 on:
+  # GitHub純正scheduleは遅延・スキップが多いので補助のみ（1時間ごと）
   schedule:
-    # 10分ごと（UTC）。実際の実行は数分〜十数分遅れることがあります
-    - cron: "5,15,25,35,45,55 * * * *"
+    - cron: "7 * * * *"
+  # 本番の10分間隔は cron-job.org からこのトリガーを叩く
   workflow_dispatch:
     inputs:
       test_mail:
