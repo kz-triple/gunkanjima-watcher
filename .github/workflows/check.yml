@@ -1,0 +1,49 @@
+name: Gunkanjima availability check
+
+on:
+  schedule:
+    # 10分ごと（UTC）。実際の実行は数分遅れることがあります
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: gunkanjima-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore previous state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: watcher-state-${{ github.run_id }}
+          restore-keys: |
+            watcher-state-
+
+      - name: Check availability and email if open
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TARGET_DATE: "2026-11-19"
+          TARGET_SLOT: "AM"
+          PARTY_SIZE: "2"
+          ALERT_ON_OK: "true"
+          ALERT_ON_LIMITED: "true"
+        run: python watcher.py --once
