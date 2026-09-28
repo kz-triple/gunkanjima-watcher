@@ -5,6 +5,11 @@ on:
     # 10分ごと（UTC）。実際の実行は数分遅れることがあります
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      test_mail:
+        description: "Send a test email instead of checking availability"
+        type: boolean
+        default: false
 
 concurrency:
   group: gunkanjima-watcher
@@ -26,6 +31,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore previous state
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_mail == false }}
         uses: actions/cache@v4
         with:
           path: state.json
@@ -33,7 +39,19 @@ jobs:
           restore-keys: |
             watcher-state-
 
+      - name: Send test email
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_mail }}
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python watcher.py --test-mail
+
       - name: Check availability and email if open
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_mail == false }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
