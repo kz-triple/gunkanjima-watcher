@@ -125,15 +125,15 @@ def response_text(response: requests.Response) -> str:
 def http_get(url: str, session: requests.Session | None = None, **kwargs) -> str:
     sess = session or requests.Session()
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
-            response = sess.get(url, headers=HEADERS, timeout=40, **kwargs)
+            response = sess.get(url, headers=HEADERS, timeout=20, **kwargs)
             response.raise_for_status()
             return response_text(response)
         except Exception as exc:
             last_error = exc
-            logging.warning("GET失敗 (%s/%s) %s: %s", attempt, 3, url, exc)
-            time.sleep(2 * attempt)
+            logging.warning("GET失敗 (%s/%s) %s: %s", attempt, 2, url, exc)
+            time.sleep(1 * attempt)
     assert last_error is not None
     raise last_error
 
@@ -146,21 +146,21 @@ def http_post(
 ) -> str:
     sess = session or requests.Session()
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             response = sess.post(
                 url,
                 headers=HEADERS,
                 data=data,
                 params=params,
-                timeout=40,
+                timeout=20,
             )
             response.raise_for_status()
             return response_text(response)
         except Exception as exc:
             last_error = exc
-            logging.warning("POST失敗 (%s/%s) %s: %s", attempt, 3, url, exc)
-            time.sleep(2 * attempt)
+            logging.warning("POST失敗 (%s/%s) %s: %s", attempt, 2, url, exc)
+            time.sleep(1 * attempt)
     assert last_error is not None
     raise last_error
 
@@ -245,16 +245,9 @@ def parse_takashima_like(
 ) -> dict[str, str]:
     year_month = target_date[:4] + target_date[5:7]
     day = str(int(target_date[8:10]))
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    # warm-up
-    warm = base_url
-    if params:
-        warm = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
-    http_get(warm, session=session)
     data = dict(post_data)
     data["yearmonth"] = year_month
-    html = http_post(base_url, data=data, session=session, params=params)
+    html = http_post(base_url, data=data, params=params)
 
     # Prefer exact cell markup.
     pattern = rf">\s*{day}\s*<p>\s*午前便\s*:\s*([^<]+)<br\s*/?>\s*午後便\s*:\s*([^<]+)\s*</p>"
@@ -400,26 +393,44 @@ COMPANIES: list[dict] = [
 
 
 def fetch_availability(target_date: str, party_size: int) -> dict[str, dict[str, str]]:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     result: dict[str, dict[str, str]] = {}
     errors: list[str] = []
-    for company in COMPANIES:
+
+    def run_one(company: dict) -> tuple[str, dict[str, str] | None, str | None]:
         name = company["name"]
         parse: Callable[[str, int], dict[str, str]] = company["parse"]
         try:
             slots = parse(target_date, party_size)
-            result[name] = {
-                "AM": slots.get("AM", "unknown"),
-                "PM": slots.get("PM", "unknown"),
-                "url": company["url"],
-            }
+            return (
+                name,
+                {
+                    "AM": slots.get("AM", "unknown"),
+                    "PM": slots.get("PM", "unknown"),
+                    "url": company["url"],
+                },
+                None,
+            )
         except Exception as exc:
             logging.exception("取得失敗: %s", name)
-            errors.append(f"{name}: {exc}")
-            result[name] = {
-                "AM": "error",
-                "PM": "error",
-                "url": company["url"],
-            }
+            return name, None, str(exc)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(run_one, company) for company in COMPANIES]
+        for fut in as_completed(futures):
+            name, slots, err = fut.result()
+            if slots is not None:
+                result[name] = slots
+            else:
+                errors.append(f"{name}: {err}")
+                company = next(c for c in COMPANIES if c["name"] == name)
+                result[name] = {
+                    "AM": "error",
+                    "PM": "error",
+                    "url": company["url"],
+                }
+
     if len(errors) == len(COMPANIES):
         raise RuntimeError("全社の空き状況取得に失敗しました:\n" + "\n".join(errors))
     return result
