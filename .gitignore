@@ -5,4 +5,8 @@ __pycache__/
 state.json
 watcher.log
 sample.html
-inspect_page.py
+calendar_sample.html
+page_content.html
+probe_*.html
+inspect_*.py
+probe_sites.py

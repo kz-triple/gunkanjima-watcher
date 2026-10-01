@@ -12,7 +12,7 @@
 | シーマン商会 | https://www.gunkanjima-tour-reserve.jp/reserve_input.php?course=1 |
 | 第七ゑびす丸 | https://mikata.in/nagasaki-tours/reservations/new?plan_id=2720 |
 
-データソース: https://nagasaki-tours.com/gunkanjima-tour-calendar
+各社の公式予約ページを直接確認します（長崎ツアーズ横断カレンダーは現在空きデータが空のため不使用）。
 
 ## 本番運用: cron-job.org（推奨・確実）
 

@@ -1,6 +1,6 @@
 """
 軍艦島ツアー空き監視
-長崎ツアーズの5社横断カレンダーを定期チェックし、空きが出たらメール通知します。
+各社の公式予約ページを定期チェックし、空きが出たらメール通知します。
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import smtplib
 import sys
 import time
@@ -17,6 +18,7 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Callable
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,36 +27,22 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
 LOG_FILE = ROOT / "watcher.log"
-CALENDAR_URL = "https://nagasaki-tours.com/gunkanjima-tour-calendar"
 
-COMPANIES = [
-    {
-        "name": "軍艦島コンシェルジュ",
-        "url": "https://www.gunkanjima-concierge.com/cgi/web/?c=reserve-1",
-    },
-    {
-        "name": "高島海上交通",
-        "url": "https://www.gunkanjima-cruise.jp/reserve_input.php",
-    },
-    {
-        "name": "やまさ海運",
-        "url": "https://order.gunkan-jima.net/yamasa",
-    },
-    {
-        "name": "シーマン商会",
-        "url": "https://www.gunkanjima-tour-reserve.jp/reserve_input.php?course=1",
-    },
-    {
-        "name": "第七ゑびす丸",
-        "url": "https://mikata.in/nagasaki-tours/reservations/new?plan_id=2720",
-    },
-]
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
 
 STATUS_LABELS = {
-    "ok": "空きあり (o)",
-    "limited": "残りわずか (△)",
-    "cancel": "満席 (x)",
+    "ok": "空きあり",
+    "limited": "残りわずか",
+    "cancel": "満席/不可",
     "unknown": "不明",
+    "error": "取得失敗",
 }
 
 
@@ -96,7 +84,7 @@ class Settings:
         def req(key: str) -> str:
             value = os.getenv(key, "").strip()
             if not value:
-                raise SystemExit(f".env に {key} を設定してください（.env.example を参照）")
+                raise SystemExit(f".env / Secrets に {key} を設定してください")
             return value
 
         def flag(key: str, default: str = "true") -> bool:
@@ -118,57 +106,322 @@ class Settings:
         )
 
 
-def classify_cell(td) -> str:
-    classes = td.get("class") or []
-    if "status-ok" in classes:
-        return "ok"
-    if "status-limited" in classes:
-        return "limited"
-    if "status-cancel" in classes:
+def response_text(response: requests.Response) -> str:
+    raw = response.content
+    try:
+        text = raw.decode("utf-8")
+        if "�" not in text[:8000]:
+            return text
+    except UnicodeDecodeError:
+        pass
+    for enc in ("cp932", "shift_jis", "euc-jp"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def http_get(url: str, session: requests.Session | None = None, **kwargs) -> str:
+    sess = session or requests.Session()
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = sess.get(url, headers=HEADERS, timeout=40, **kwargs)
+            response.raise_for_status()
+            return response_text(response)
+        except Exception as exc:
+            last_error = exc
+            logging.warning("GET失敗 (%s/%s) %s: %s", attempt, 3, url, exc)
+            time.sleep(2 * attempt)
+    assert last_error is not None
+    raise last_error
+
+
+def http_post(
+    url: str,
+    data: dict,
+    session: requests.Session | None = None,
+    params: dict | None = None,
+) -> str:
+    sess = session or requests.Session()
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = sess.post(
+                url,
+                headers=HEADERS,
+                data=data,
+                params=params,
+                timeout=40,
+            )
+            response.raise_for_status()
+            return response_text(response)
+        except Exception as exc:
+            last_error = exc
+            logging.warning("POST失敗 (%s/%s) %s: %s", attempt, 3, url, exc)
+            time.sleep(2 * attempt)
+    assert last_error is not None
+    raise last_error
+
+
+def mark_from_symbol(token: str, party_size: int) -> str:
+    token = token.strip()
+    if not token:
+        return "unknown"
+    if any(x in token for x in ["欠航", "運休", "休"]):
         return "cancel"
-    text = td.get_text(strip=True).lower()
-    if text in {"o", "〇", "○"}:
-        return "ok"
-    if text in {"△", "delta"}:
+    if "△" in token or "▲" in token:
         return "limited"
-    if text in {"x", "×"}:
+    if token in {"×", "x", "X", "✕", "満", "満席"} or "×" in token or "満" in token:
+        return "cancel"
+    if token in {"○", "◯", "〇", "o", "O"} or "○" in token or "◯" in token:
+        return "ok"
+    if re.fullmatch(r"\d+", token):
+        seats = int(token)
+        if seats >= party_size:
+            return "ok"
+        if seats > 0:
+            return "limited"
         return "cancel"
     return "unknown"
 
 
-def fetch_availability(target_date: str) -> dict[str, dict[str, str]]:
-    """Return {company_name: {'AM': status, 'PM': status, 'url': ...}}"""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; GunkanjimaWatcher/1.0; "
-            "+personal-availability-monitor)"
-        )
-    }
-    response = requests.get(CALENDAR_URL, headers=headers, timeout=30)
-    response.raise_for_status()
-    response.encoding = response.apparent_encoding or "utf-8"
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    row = None
-    for tr in soup.find_all("tr"):
-        first = tr.find("td")
-        if first and first.get_text(strip=True) == target_date:
-            row = tr
+def parse_concierge(target_date: str, party_size: int) -> dict[str, str]:
+    year_month = target_date[:7]
+    day = str(int(target_date[8:10]))
+    url = f"https://www.gunkanjima-concierge.com/cgi/web/?c=reserve-1&YYMM={year_month}"
+    html = http_get(url)
+    soup = BeautifulSoup(html, "html.parser")
+    target_td = None
+    for td in soup.find_all("td"):
+        day_el = td.find("div", class_="day")
+        if day_el and day_el.get_text(strip=True) == day:
+            target_td = td
             break
-    if row is None:
-        raise RuntimeError(f"{target_date} の行が見つかりませんでした（カレンダー未掲載の可能性）")
+    if target_td is None:
+        raise RuntimeError("コンシェルジュ: 対象日セルなし")
 
-    cells = row.find_all("td")[1:]
-    if len(cells) < 10:
-        raise RuntimeError(f"セル数が不足しています: {len(cells)}")
+    result = {"AM": "unknown", "PM": "unknown"}
+    blocks = target_td.select("div.def > div")
+    for block in blocks:
+        dt = block.find("dt")
+        if not dt:
+            continue
+        label = dt.get_text(strip=True)
+        slot = "AM" if "午前" in label else "PM" if "午後" in label else None
+        if not slot:
+            continue
+        classes = block.get("class") or []
+        dd = block.find("dd")
+        dd_text = dd.get_text(" ", strip=True) if dd else ""
+        if "disable" in classes or "満" in dd_text:
+            result[slot] = "cancel"
+        elif block.find("input"):
+            nums = [int(n) for n in re.findall(r"\d+", dd_text)]
+            if nums:
+                total = sum(nums)
+                if total >= party_size:
+                    result[slot] = "ok"
+                elif total > 0:
+                    result[slot] = "limited"
+                else:
+                    result[slot] = "cancel"
+            else:
+                result[slot] = "ok"
+        elif "休" in dd_text:
+            result[slot] = "cancel"
+        else:
+            result[slot] = mark_from_symbol(dd_text, party_size)
+    return result
 
+
+def parse_takashima_like(
+    target_date: str,
+    party_size: int,
+    base_url: str,
+    post_data: dict,
+    params: dict | None = None,
+) -> dict[str, str]:
+    year_month = target_date[:4] + target_date[5:7]
+    day = str(int(target_date[8:10]))
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    # warm-up
+    warm = base_url
+    if params:
+        warm = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+    http_get(warm, session=session)
+    data = dict(post_data)
+    data["yearmonth"] = year_month
+    html = http_post(base_url, data=data, session=session, params=params)
+
+    # Prefer exact cell markup.
+    pattern = rf">\s*{day}\s*<p>\s*午前便\s*:\s*([^<]+)<br\s*/?>\s*午後便\s*:\s*([^<]+)\s*</p>"
+    match = re.search(pattern, html)
+    if not match:
+        # Some pages use full-width digits or different spacing.
+        pattern2 = rf">\s*{day}\s*<p>([\s\S]*?)</p>"
+        match2 = re.search(pattern2, html)
+        if not match2:
+            raise RuntimeError(f"対象日セルなし: {base_url}")
+        cell = match2.group(1)
+        am_m = re.search(r"午前便\s*:\s*([^\s<]+)", cell)
+        pm_m = re.search(r"午後便\s*:\s*([^\s<]+)", cell)
+        if not am_m or not pm_m:
+            raise RuntimeError(f"午前/午後の記号なし: {base_url}")
+        am_token, pm_token = am_m.group(1), pm_m.group(1)
+    else:
+        am_token, pm_token = match.group(1).strip(), match.group(2).strip()
+
+    return {
+        "AM": mark_from_symbol(am_token, party_size),
+        "PM": mark_from_symbol(pm_token, party_size),
+    }
+
+
+def parse_takashima(target_date: str, party_size: int) -> dict[str, str]:
+    return parse_takashima_like(
+        target_date,
+        party_size,
+        "https://www.gunkanjima-cruise.jp/reserve_input.php",
+        post_data={},
+    )
+
+
+def parse_seaman(target_date: str, party_size: int) -> dict[str, str]:
+    return parse_takashima_like(
+        target_date,
+        party_size,
+        "https://www.gunkanjima-tour-reserve.jp/reserve_input.php",
+        post_data={
+            "course": "1",
+            "language": "ja",
+            "nflames": "",
+            "sdatey": "",
+            "sdatem": "",
+            "sdated": "",
+            "dweek": "",
+            "bin": "",
+            "bspace": "",
+            "sfocus": "",
+            "reset": "",
+            "act": "",
+        },
+        params={"course": "1"},
+    )
+
+
+def parse_yamasa(target_date: str, party_size: int) -> dict[str, str]:
+    ymd = target_date.replace("-", "")[:6] + "01"
+    url = f"https://order.gunkan-jima.net/yamasa/ja/Event/Calender?ymd={ymd}&crs=10"
+    html = http_get(url)
+    soup = BeautifulSoup(html, "html.parser")
+    day = str(int(target_date[8:10]))
+    target_span = None
+    for span in soup.select("span.day"):
+        if span.get_text(strip=True) == day:
+            target_span = span
+            break
+    if target_span is None:
+        raise RuntimeError("やまさ海運: 対象日なし")
+    state = target_span.find_next_sibling("span", class_="state")
+    if state is None:
+        parent = target_span.parent
+        state = parent.find("span", class_="state") if parent else None
+    if state is None:
+        raise RuntimeError("やまさ海運: 状態なし")
+
+    am = pm = "unknown"
+    for a in state.find_all("a"):
+        text = a.get_text(" ", strip=True)
+        # e.g. 09:00：× / 13:00：△
+        m = re.search(r"(09:00|13:00)\s*[:：]\s*(.+)", text)
+        if not m:
+            continue
+        token = m.group(2).strip()
+        # decode HTML entities like &#215; already handled by BS text
+        status = mark_from_symbol(token, party_size)
+        if m.group(1) == "09:00":
+            am = status
+        else:
+            pm = status
+    return {"AM": am, "PM": pm}
+
+
+def parse_ebisu(target_date: str, party_size: int) -> dict[str, str]:
+    """
+    第七ゑびす丸(ミカタ)は日付単位。選択可ならAM/PMとも空き候補、不可なら満席扱い。
+    """
+    del party_size  # date-level availability only
+    url = "https://mikata.in/nagasaki-tours/reservations/new?plan_id=2720"
+    html = http_get(url)
+    soup = BeautifulSoup(html, "html.parser")
+    td = soup.find("td", class_=re.compile(rf"calendar-date-{re.escape(target_date)}"))
+    if td is None:
+        raise RuntimeError("第七ゑびす丸: 対象日なし")
+    classes = " ".join(td.get("class") or [])
+    if "calendar-select-date" in classes or "calendar-other-month-select-date" in classes:
+        status = "ok"
+    elif td.find("i", class_=re.compile(r"fa-minus")):
+        status = "cancel"
+    else:
+        status = "unknown"
+    return {"AM": status, "PM": status}
+
+
+COMPANIES: list[dict] = [
+    {
+        "name": "軍艦島コンシェルジュ",
+        "url": "https://www.gunkanjima-concierge.com/cgi/web/?c=reserve-1",
+        "parse": parse_concierge,
+    },
+    {
+        "name": "高島海上交通",
+        "url": "https://www.gunkanjima-cruise.jp/reserve_input.php",
+        "parse": parse_takashima,
+    },
+    {
+        "name": "やまさ海運",
+        "url": "https://order.gunkan-jima.net/yamasa",
+        "parse": parse_yamasa,
+    },
+    {
+        "name": "シーマン商会",
+        "url": "https://www.gunkanjima-tour-reserve.jp/reserve_input.php?course=1",
+        "parse": parse_seaman,
+    },
+    {
+        "name": "第七ゑびす丸",
+        "url": "https://mikata.in/nagasaki-tours/reservations/new?plan_id=2720",
+        "parse": parse_ebisu,
+    },
+]
+
+
+def fetch_availability(target_date: str, party_size: int) -> dict[str, dict[str, str]]:
     result: dict[str, dict[str, str]] = {}
-    for i, company in enumerate(COMPANIES):
-        result[company["name"]] = {
-            "AM": classify_cell(cells[i * 2]),
-            "PM": classify_cell(cells[i * 2 + 1]),
-            "url": company["url"],
-        }
+    errors: list[str] = []
+    for company in COMPANIES:
+        name = company["name"]
+        parse: Callable[[str, int], dict[str, str]] = company["parse"]
+        try:
+            slots = parse(target_date, party_size)
+            result[name] = {
+                "AM": slots.get("AM", "unknown"),
+                "PM": slots.get("PM", "unknown"),
+                "url": company["url"],
+            }
+        except Exception as exc:
+            logging.exception("取得失敗: %s", name)
+            errors.append(f"{name}: {exc}")
+            result[name] = {
+                "AM": "error",
+                "PM": "error",
+                "url": company["url"],
+            }
+    if len(errors) == len(COMPANIES):
+        raise RuntimeError("全社の空き状況取得に失敗しました:\n" + "\n".join(errors))
     return result
 
 
@@ -210,7 +463,9 @@ def format_snapshot(availability: dict[str, dict[str, str]], slot: str) -> str:
     for company in COMPANIES:
         name = company["name"]
         status = availability[name][slot]
-        lines.append(f"- {name}: {STATUS_LABELS.get(status, status)}  {company['url']}")
+        lines.append(
+            f"- {name}: {STATUS_LABELS.get(status, status)}  {company['url']}"
+        )
     return "\n".join(lines)
 
 
@@ -231,15 +486,13 @@ def build_alert_body(
         f"【空き検知】\n{hit_lines}\n\n"
         f"【当日の全社状況】\n"
         f"{format_snapshot(availability, settings.target_slot)}\n\n"
-        f"横断カレンダー:\n{CALENDAR_URL}\n\n"
-        "※長崎ツアーズの集計反映には遅れがある場合があります。"
-        "必ず各社の公式予約ページで確定してください。\n"
-        "※残りわずか(△)は2名分が取れない可能性もあります。急いで確認してください。"
+        "※必ず各社の公式予約ページで確定してください。\n"
+        "※残りわずかは2名分が取れない可能性もあります。急いで確認してください。"
     )
 
 
 def check_once(settings: Settings, force_mail: bool = False) -> list[tuple[str, str, str]]:
-    availability = fetch_availability(settings.target_date)
+    availability = fetch_availability(settings.target_date, settings.party_size)
     logging.info(
         "取得完了 %s %s\n%s",
         settings.target_date,
@@ -262,7 +515,6 @@ def check_once(settings: Settings, force_mail: bool = False) -> list[tuple[str, 
     for name, status, url in hits:
         key = f"{key_prefix}:{name}"
         prev = alerted.get(key)
-        # 同じステータスで連続通知しない。改善時は再通知。
         if force_mail or prev != status:
             new_hits.append((name, status, url))
             alerted[key] = status
@@ -313,16 +565,8 @@ def run_loop(settings: Settings) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="軍艦島ツアー空き監視")
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="1回だけチェックして終了",
-    )
-    parser.add_argument(
-        "--test-mail",
-        action="store_true",
-        help="テストメールを送信して終了",
-    )
+    parser.add_argument("--once", action="store_true", help="1回だけチェックして終了")
+    parser.add_argument("--test-mail", action="store_true", help="テストメールを送信して終了")
     parser.add_argument(
         "--force-mail",
         action="store_true",
